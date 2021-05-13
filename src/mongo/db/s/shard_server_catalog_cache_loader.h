@@ -344,6 +344,16 @@ private:
     typedef std::map<NamespaceString, CollAndChunkTaskList> CollAndChunkTaskLists;
 
     /**
+     * Renames the chunks cache based on the collection namespace with the collection UUID and vice
+     * versa. The renaming using the collection UUID is applied in FCV 5.0, while the
+     * collection namespace in lower FCV.
+     */
+    void _renameChunksCache(OperationContext* opCtx,
+                            const NamespaceString& nss,
+                            const UUID& uuid,
+                            const boost::optional<Timestamp>& timestamp);
+
+    /**
      * Forces the primary to refresh its metadata for 'nss' and waits until this node's metadata
      * has caught up to the primary's.
      *
@@ -361,7 +371,7 @@ private:
      *
      * Returns the metadata retrieved locally from the shard persisted metadata
      * store and any in-memory enqueued tasks to update that store that match the given term,
-     * grather then or equal to the given chunk version.
+     * greather then or equal to the given chunk version.
      *
      * Only run on the shard primary.
      */

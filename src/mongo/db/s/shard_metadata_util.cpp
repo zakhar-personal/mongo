@@ -276,23 +276,26 @@ Status updateShardDatabasesEntry(OperationContext* opCtx,
 
 StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
                                                    const NamespaceString& nss,
+                                                   const boost::optional<UUID>& uuid,
                                                    const BSONObj& query,
                                                    const BSONObj& sort,
                                                    boost::optional<long long> limit,
                                                    const OID& epoch,
                                                    const boost::optional<Timestamp>& timestamp) {
+    const NamespaceString chunksNss{
+        ChunkType::ShardNSPrefix +
+        (!nss.isTemporaryReshardingCollection() && uuid ? uuid->toString() : nss.ns())};
+
     try {
+        DBDirectClient client(opCtx);
+
         Query fullQuery(query);
         fullQuery.sort(sort);
 
-        DBDirectClient client(opCtx);
-
-        const std::string chunkMetadataNs = ChunkType::ShardNSPrefix + nss.ns();
-
         std::unique_ptr<DBClientCursor> cursor =
-            client.query(NamespaceString(chunkMetadataNs), fullQuery, limit.get_value_or(0));
+            client.query(chunksNss, fullQuery, limit.get_value_or(0));
         uassert(ErrorCodes::OperationFailed,
-                str::stream() << "Failed to establish a cursor for reading " << chunkMetadataNs
+                str::stream() << "Failed to establish a cursor for reading " << chunksNss.ns()
                               << " from local storage",
                 cursor);
 
@@ -316,23 +319,26 @@ StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
 
 Status updateShardChunks(OperationContext* opCtx,
                          const NamespaceString& nss,
+                         const boost::optional<UUID>& uuid,
                          const std::vector<ChunkType>& chunks,
                          const OID& currEpoch) {
     invariant(!chunks.empty());
 
-    NamespaceString chunkMetadataNss(ChunkType::ShardNSPrefix + nss.ns());
+    const NamespaceString chunksNss{
+        ChunkType::ShardNSPrefix +
+        (!nss.isTemporaryReshardingCollection() && uuid ? uuid->toString() : nss.ns())};
 
     try {
         DBDirectClient client(opCtx);
 
         // This may be the first update, so the first opportunity to create an index.
         // If the index already exists, this is a no-op.
-        client.createIndex(chunkMetadataNss.ns(), BSON(ChunkType::lastmod() << 1));
+        client.createIndex(chunksNss.ns(), BSON(ChunkType::lastmod() << 1));
 
         /**
          * Here are examples of the operations that can happen on the config server to update
-         * the config.chunks collection. 'chunks' only includes the chunks that result from the
-         * operations, which can be read from the config server, not any that were removed, so
+         * the config.cache.chunks collection. 'chunks' only includes the chunks that result from
+         * the operations, which can be read from the config server, not any that were removed, so
          * we must delete any chunks that overlap with the new 'chunks'.
          *
          * CollectionVersion = 10.3
@@ -359,7 +365,7 @@ Status updateShardChunks(OperationContext* opCtx,
             //
             // query: { "_id" : {"$gte": chunk.min, "$lt": chunk.max}}
             auto deleteCommandResponse = client.runCommand([&] {
-                write_ops::DeleteCommandRequest deleteOp(chunkMetadataNss);
+                write_ops::DeleteCommandRequest deleteOp(chunksNss);
                 deleteOp.setDeletes({[&] {
                     write_ops::DeleteOpEntry entry;
                     entry.setQ(BSON(ChunkType::minShardID
@@ -374,7 +380,7 @@ Status updateShardChunks(OperationContext* opCtx,
 
             // Now the document can be expected to cleanly insert without overlap
             auto insertCommandResponse = client.runCommand([&] {
-                write_ops::InsertCommandRequest insertOp(chunkMetadataNss);
+                write_ops::InsertCommandRequest insertOp(chunksNss);
                 insertOp.setDocuments({chunk.toShardBSON()});
                 return insertOp.serialize({});
             }());
@@ -410,8 +416,13 @@ void updateTimestampOnShardCollections(OperationContext* opCtx,
 
 Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const NamespaceString& nss) {
     try {
-        DBDirectClient client(opCtx);
+        const auto statusWithCollectionEntry = readShardCollectionsEntry(opCtx, nss);
+        if (!statusWithCollectionEntry.isOK()) {
+            return Status::OK();
+        }
+        const auto uuid = statusWithCollectionEntry.getValue().getUuid();
 
+        DBDirectClient client(opCtx);
         auto deleteCommandResponse = client.runCommand([&] {
             write_ops::DeleteCommandRequest deleteOp(
                 NamespaceString::kShardConfigCollectionsNamespace);
@@ -426,15 +437,7 @@ Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const Namesp
         uassertStatusOK(
             getStatusFromWriteCommandResponse(deleteCommandResponse->getCommandReply()));
 
-        // Drop the corresponding config.chunks.ns collection
-        BSONObj result;
-        if (!client.dropCollection(
-                ChunkType::ShardNSPrefix + nss.ns(), kLocalWriteConcern, &result)) {
-            Status status = getStatusFromCommandResult(result);
-            if (status != ErrorCodes::NamespaceNotFound) {
-                uassertStatusOK(status);
-            }
-        }
+        dropChunks(opCtx, nss, uuid);
 
         LOGV2_DEBUG(
             22090,
@@ -449,12 +452,16 @@ Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const Namesp
     }
 }
 
-void dropChunks(OperationContext* opCtx, const NamespaceString& nss) {
-    DBDirectClient client(opCtx);
+void dropChunks(OperationContext* opCtx,
+                const NamespaceString& nss,
+                const std::optional<UUID>& uuid) {
+    const auto chunksNs = ChunkType::ShardNSPrefix +
+        (!nss.isTemporaryReshardingCollection() && uuid ? uuid->toString() : nss.ns());
 
     // Drop the config.chunks collection associated with namespace 'nss'.
+    DBDirectClient client(opCtx);
     BSONObj result;
-    if (!client.dropCollection(ChunkType::ShardNSPrefix + nss.ns(), kLocalWriteConcern, &result)) {
+    if (!client.dropCollection(chunksNs, kLocalWriteConcern, &result)) {
         auto status = getStatusFromCommandResult(result);
         if (status != ErrorCodes::NamespaceNotFound) {
             uassertStatusOK(status);
@@ -470,7 +477,6 @@ void dropChunks(OperationContext* opCtx, const NamespaceString& nss) {
 Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName) {
     try {
         DBDirectClient client(opCtx);
-
         auto deleteCommandResponse = client.runCommand([&] {
             write_ops::DeleteCommandRequest deleteOp(
                 NamespaceString::kShardConfigDatabasesNamespace);

@@ -440,19 +440,32 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindMixedChun
 TEST_F(ShardServerCatalogCacheLoaderTest,
        PrimaryLoadFromShardedAndFindCollAndChunksMetadataFormatChanged) {
     // First set up the shard chunk loader as sharded.
-    vector<ChunkType> chunks = setUpChunkLoaderWithFiveChunks();
+    ChunkVersion collectionVersion(1, 0, OID::gen(), boost::none /* timestamp */);
+    CollectionType collectionType = makeCollectionType(collectionVersion);
+    vector<ChunkType> chunks = makeFiveChunks(collectionVersion);
+    _remoteLoaderMock->setCollectionRefreshReturnValue(collectionType);
+    _remoteLoaderMock->setChunkRefreshReturnValue(chunks);
+
+    auto collAndChunksRes = _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED()).get();
+    ASSERT_EQUALS(collAndChunksRes.epoch, collectionType.getEpoch());
+    ASSERT_EQUALS(collAndChunksRes.changedChunks.size(), 5UL);
+    ASSERT(!collAndChunksRes.timeseriesFields.is_initialized());
+    for (unsigned int i = 0; i < collAndChunksRes.changedChunks.size(); ++i) {
+        ASSERT_BSONOBJ_EQ(collAndChunksRes.changedChunks[i].toShardBSON(), chunks[i].toShardBSON());
+    }
 
     // Simulating that the config server added timestamps to all chunks
     {
+        const auto timestamp = Timestamp(42);
         vector<ChunkType> newChunks = chunks;
         for (auto& chunk : newChunks) {
             const ChunkVersion v = chunk.getVersion();
             chunk.setVersion(
-                ChunkVersion(v.majorVersion(), v.minorVersion(), v.epoch(), Timestamp(42)));
+                ChunkVersion(v.majorVersion(), v.minorVersion(), v.epoch(), timestamp));
         }
 
-        CollectionType collectionTypeWithNewEpoch =
-            makeCollectionType(newChunks.back().getVersion());
+        CollectionType collectionTypeWithNewEpoch(collectionType);
+        collectionTypeWithNewEpoch.setTimestamp(timestamp);
         _remoteLoaderMock->setCollectionRefreshReturnValue(collectionTypeWithNewEpoch);
         _remoteLoaderMock->setChunkRefreshReturnValue(newChunks);
 
@@ -475,8 +488,8 @@ TEST_F(ShardServerCatalogCacheLoaderTest,
                 ChunkVersion(v.majorVersion(), v.minorVersion(), v.epoch(), boost::none));
         }
 
-        CollectionType collectionTypeWithNewEpoch =
-            makeCollectionType(newChunks.back().getVersion());
+        CollectionType collectionTypeWithNewEpoch(collectionType);
+        collectionTypeWithNewEpoch.setTimestamp(boost::none);
         _remoteLoaderMock->setCollectionRefreshReturnValue(collectionTypeWithNewEpoch);
         _remoteLoaderMock->setChunkRefreshReturnValue(newChunks);
 
